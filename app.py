@@ -84,7 +84,7 @@ TERMINAL_HTML = """
     <div class="header">
         > ENGINE: APEX_QUANTUM<br>
         > DB_RECORDS: {{ db_count }}<br>
-        > USER: TEJAS BHAVSAR
+        > PLAY- DON'T BET ON LOW BETE ONLY HIGH AND SURESHOTS PLAY 4 LEVEL MAX
     </div>
 
     <a href="/" class="btn-refresh">[ SYNC DATA ]</a>
@@ -266,4 +266,5 @@ def dashboard():
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10001))
+
     app.run(host='0.0.0.0', port=port)
