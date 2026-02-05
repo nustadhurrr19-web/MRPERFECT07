@@ -1,104 +1,178 @@
-import requests
-import time
-import threading
 import os
+import requests
 import sqlite3
+import threading
+import time
+from datetime import datetime
+from collections import Counter
 from flask import Flask, render_template_string, jsonify, redirect
-from logic import TitanLogic
 
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
 API_URL = "https://api-iok6.onrender.com/api/get_history"
-PLATFORM_URL = "https://example.com"
-DB_FILE = "/tmp/titan_core_v3.db" 
+PLATFORM_URL = "https://example.com" 
 
 app = Flask(__name__)
+
+# ==========================================
+# 🧠 LOGIC ENGINE (FROM YOUR WORKING FILE)
+# ==========================================
+class TitanLogic:
+    def __init__(self):
+        self.streak = 0
+        self.wins = 0
+        self.losses = 0
+
+    def analyze(self, history):
+        # history: list of dicts [{'n': 1, 's': 'SMALL', 'id': '123'}] (Oldest -> Newest)
+        if len(history) < 15: return None, "SYNCING..."
+
+        # 1. VIOLET CHECK (0/5)
+        last_n = history[-1]['n']
+        is_violet = (last_n == 0 or last_n == 5)
+
+        # 2. PATTERN SCAN
+        pred5, str5 = self.get_pattern(history, 5)
+        pred3, str3 = self.get_pattern(history, 3)
+
+        if pred5 and pred3 and pred5 != pred3:
+            if str5 > 0.90: best_pred, strength = pred5, str5
+            elif str3 > 0.90: best_pred, strength = pred3, str3
+            else: return None, "WAITING... (CONFLICT)"
+        else:
+            best_pred = pred5 if str5 >= str3 else pred3
+            strength = max(str5, str3)
+
+        if not best_pred:
+             best_pred = history[-1]['s']
+             strength = 0.5
+
+        # 3. DECISION
+        n1, n2 = history[-1]['n'], history[-2]['n']
+        is_symmetric = (n1 + n2 == 9 or n1 == n2)
+
+        if is_violet:
+            if strength > 0.90 and is_symmetric: return best_pred, "SURESHOT (VIOLET SAFE)"
+            else: return None, "SKIP (0/5 DETECTED)"
+
+        if self.streak >= 2: return best_pred, "RECOVERY"
+        if strength > 0.85 and is_symmetric: return best_pred, "SURESHOT"
+        if strength > 0.65: return best_pred, "HIGH BET"
+        
+        return None, "WAITING..."
+
+    def get_pattern(self, history, depth):
+        if len(history) < depth + 1: return None, 0
+        last_seq = [x['s'] for x in history[-depth:]]
+        matches = [history[i+depth]['s'] for i in range(len(history)-(depth+1)) 
+                   if [x['s'] for x in history[i:i+depth]] == last_seq]
+        if matches:
+            c = Counter(matches)
+            top = c.most_common(1)[0]
+            return top[0], top[1]/len(matches)
+        return None, 0
+
 engine = TitanLogic()
 
 # ==========================================
-# 💾 DATABASE LAYER
+# 💾 MEMORY DATABASE (The Fix)
 # ==========================================
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS history 
-                        (issue TEXT PRIMARY KEY, num INTEGER, size TEXT)''')
-        conn.commit()
+# We use a global list instead of a file. fast & reliable.
+DB_MEMORY = [] 
 
-def save_data(data_list):
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            for item in data_list:
-                num = int(item['number'])
-                size = "BIG" if num >= 5 else "SMALL"
-                issue = str(item['issueNumber'])
-                conn.execute("INSERT OR IGNORE INTO history VALUES (?,?,?)", (issue, num, size))
-        return True
-    except: return False
-
-def load_history(limit=600):
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.execute(f"SELECT issue, num, size FROM history ORDER BY issue DESC LIMIT {limit}")
-            rows = cursor.fetchall()
-        data = [{"id": r[0], "n": r[1], "s": r[2]} for r in rows]
-        return list(reversed(data))
-    except: return []
+def sync_data():
+    """Forces 100 items download on startup"""
+    global DB_MEMORY
+    print("🔄 SYNCING DATA...")
+    temp_data = []
+    # Loop exactly like your working code
+    for p in range(1, 6):
+        try:
+            r = requests.get(API_URL, params={"size": "20", "pageNo": str(p)}, timeout=5)
+            if r.status_code == 200:
+                items = r.json().get('data', {}).get('list', [])
+                for item in items:
+                    temp_data.append({
+                        'n': int(item['number']),
+                        's': "BIG" if int(item['number']) >= 5 else "SMALL",
+                        'id': str(item['issueNumber'])
+                    })
+        except: pass
+    
+    # Sort Oldest -> Newest
+    temp_data.sort(key=lambda x: int(x['id']))
+    
+    # Update Global DB (remove duplicates)
+    seen = set()
+    new_db = []
+    for d in temp_data:
+        if d['id'] not in seen:
+            new_db.append(d)
+            seen.add(d['id'])
+    
+    DB_MEMORY = new_db
+    print(f"✅ SYNC DONE. RECORDS: {len(DB_MEMORY)}")
 
 # ==========================================
-# 🔄 BACKGROUND WORKER
+# 🔄 WORKER LOOP
 # ==========================================
 global_state = {
     "period": "Loading...", "prediction": "--", "type": "WAITING...",
-    "streak": 0, "win_count": 0, "loss_count": 0, "db_count": 0, "logs": []
+    "streak": 0, "w": 0, "l": 0, "count": 0, "logs": []
 }
 
 def worker():
-    init_db()
-    # Force Initial Sync
-    try:
-        r = requests.get(API_URL, params={"size": "300", "pageNo": "1"}, timeout=15)
-        if r.status_code == 200: save_data(r.json()['data']['list'])
-    except: pass
-
+    sync_data() # Initial Load
+    
     last_id = None
     active_bet = None
 
     while True:
         try:
+            # Poll latest
             r = requests.get(API_URL, params={"size": "1", "pageNo": "1"}, timeout=5)
             if r.status_code == 200:
-                latest = r.json()['data']['list'][0]
-                curr_id = str(latest['issueNumber'])
-                save_data([latest])
+                raw = r.json()['data']['list'][0]
+                curr_id = str(raw['issueNumber'])
                 
-                history = load_history(600)
-                global_state['db_count'] = len(history)
+                # Add to memory
+                new_item = {
+                    'n': int(raw['number']),
+                    's': "BIG" if int(raw['number']) >= 5 else "SMALL",
+                    'id': curr_id
+                }
+                
+                if not DB_MEMORY or DB_MEMORY[-1]['id'] != curr_id:
+                    DB_MEMORY.append(new_item)
+                    if len(DB_MEMORY) > 1000: DB_MEMORY.pop(0)
 
                 if curr_id != last_id:
-                    # Validate
+                    # Check Win/Loss
                     if active_bet and active_bet['id'] == curr_id:
-                        real_size = "BIG" if int(latest['number']) >= 5 else "SMALL"
+                        real = new_item['s']
                         if "SKIP" not in active_bet['type'] and "WAITING" not in active_bet['type']:
-                            if active_bet['size'] == real_size:
-                                engine.update_stats(True)
-                                status = "WIN"
+                            if active_bet['pred'] == real:
+                                engine.wins += 1
+                                engine.streak = 0
+                                res = "WIN"
                             else:
-                                engine.update_stats(False)
-                                status = "LOSS"
-                            global_state['logs'].insert(0, {"id": curr_id[-4:], "res": real_size, "s": status})
-                            global_state['logs'] = global_state['logs'][:8]
-
-                    # Predict
-                    next_id = str(int(curr_id) + 1)
-                    pred, p_type = engine.analyze(history)
+                                engine.losses += 1
+                                engine.streak += 1
+                                res = "LOSS"
+                            global_state['logs'].insert(0, {"id":curr_id[-4:], "r":real, "s":res})
                     
-                    active_bet = {'id': next_id, 'size': pred, 'type': p_type}
+                    # Predict Next
+                    next_id = str(int(curr_id) + 1)
+                    pred, p_type = engine.analyze(DB_MEMORY)
+                    
+                    active_bet = {'id': next_id, 'pred': pred, 'type': p_type}
                     last_id = curr_id
                     
                     global_state.update({
                         "period": next_id, "prediction": pred if pred else "--", "type": p_type,
-                        "streak": engine.streak, "win_count": engine.wins, "loss_count": engine.losses
+                        "streak": engine.streak, "w": engine.wins, "l": engine.losses,
+                        "count": len(DB_MEMORY)
                     })
             time.sleep(2)
         except: time.sleep(5)
@@ -106,7 +180,7 @@ def worker():
 threading.Thread(target=worker, daemon=True).start()
 
 # ==========================================
-# 🌐 UI TEMPLATE
+# 🌐 UI
 # ==========================================
 HTML = """
 <!DOCTYPE html>
@@ -114,7 +188,7 @@ HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TITAN PRO V3</title>
+    <title>TITAN PRO V5</title>
     <style>
         body { background: #000; color: #fff; font-family: monospace; padding: 20px; display: flex; flex-direction: column; align-items: center; }
         .box { border: 1px solid #333; padding: 20px; width: 100%; max-width: 600px; margin-bottom: 20px; border-radius: 8px; background: #090909; }
@@ -133,34 +207,48 @@ HTML = """
 </head>
 <body>
     <div class="box">
-        <div class="h-row"><span>TITAN PRO V3</span><span style="color:#00f2ff">DB: <span id="db">0</span></span></div>
+        <div class="h-row">
+            <span>TITAN PRO V5</span>
+            <span style="color:#00f2ff">DB: <span id="db">0</span></span>
+        </div>
         <div style="text-align: center;">
-            <div style="color:#888">PERIOD: <span id="p">...</span></div>
+            <div style="color:#888">PERIOD: <span id="p">Scanning...</span></div>
             <div style="margin-top:10px;"><span id="t" class="tag WAITING...">WAITING...</span></div>
             <div id="pred" class="big-txt">--</div>
             <div id="alert" style="display:none; color:#ff0055; font-weight:bold;">⚠️ RECOVERY MODE</div>
         </div>
         <a href="/go" class="btn">OPEN PLATFORM</a>
     </div>
+
     <div class="box">
-        <div class="h-row"><span>HISTORY</span><span>W:<span id="w">0</span> L:<span id="l">0</span></span></div>
+        <div class="h-row">
+            <span>HISTORY</span>
+            <span>W:<span id="w">0</span> L:<span id="l">0</span></span>
+        </div>
         <div id="logs"></div>
     </div>
+
     <script>
         setInterval(() => {
             fetch('/api/state').then(r => r.json()).then(d => {
-                document.getElementById('db').innerText = d.db_count;
+                document.getElementById('db').innerText = d.count;
                 document.getElementById('p').innerText = d.period;
                 document.getElementById('t').innerText = d.type;
                 document.getElementById('t').className = 'tag ' + d.type.split(' ')[0];
                 document.getElementById('pred').innerText = d.prediction;
                 document.getElementById('pred').className = 'big-txt ' + d.prediction;
-                document.getElementById('w').innerText = d.win_count;
-                document.getElementById('l').innerText = d.loss_count;
+                document.getElementById('w').innerText = d.w;
+                document.getElementById('l').innerText = d.l;
+                
                 if (d.streak > 0) document.getElementById('alert').style.display = 'block';
                 else document.getElementById('alert').style.display = 'none';
+
                 document.getElementById('logs').innerHTML = d.logs.map(l => `
-                    <div class="log-row"><span>#${l.id}</span><span class="${l.res}">${l.res}</span><span style="color:${l.s=='WIN'?'#00ff88':'#ff0055'}">${l.s}</span></div>
+                    <div class="log-row">
+                        <span>#${l.id}</span>
+                        <span class="${l.r}">${l.r}</span>
+                        <span style="color:${l.s=='WIN'?'#00ff88':'#ff0055'}">${l.s}</span>
+                    </div>
                 `).join('');
             });
         }, 1000);
