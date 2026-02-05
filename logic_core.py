@@ -5,268 +5,169 @@ from datetime import datetime
 from collections import Counter
 
 # =====================================================
-# 🏛️ CONFIGURATION
+# 🏛️ CORE CONFIGURATION
 # =====================================================
 API_URL = "https://api-iok6.onrender.com/api/get_history"
-# Using memory ensures speed on Render
-DB_FILE = ":memory:" 
+DB_FILE = ":memory:"
 
 # =====================================================
-# 🧠 APEX QUANTUM ENGINE (FULLY EXPANDED)
+# 🧠 APEX QUANTUM ENGINE (V2 ULTIMATE FROM PP.PY)
 # =====================================================
 class ApexQuantum:
     
     def get_size(self, n): 
-        # Converts number to size string
-        if int(n) >= 5:
-            return "BIG"
-        else:
-            return "SMALL"
+        return "BIG" if int(n) >= 5 else "SMALL"
+
+    def get_pattern_strength(self, history, depth):
+        """Helper to check a specific depth pattern."""
+        if len(history) < depth + 1: return None, 0
+        
+        # history is Newest -> Oldest. We need Oldest -> Newest for scanning.
+        data_rev = list(reversed([{'s': h['size']} for h in history]))
+        
+        last_seq = [x['s'] for x in data_rev[-depth:]]
+        matches = []
+        
+        search_limit = len(data_rev) - (depth + 1)
+        for i in range(search_limit):
+            current_chunk = [x['s'] for x in data_rev[i : i+depth]]
+            if current_chunk == last_seq:
+                matches.append(data_rev[i+depth]['s'])
+        
+        if matches:
+            counts = Counter(matches)
+            pred_item = counts.most_common(1)[0][0]
+            strength = counts[pred_item] / len(matches)
+            return pred_item, strength
+        return None, 0
 
     def analyze_bet_type(self, history, current_streak=0):
         """
-        Analyzes the history to determine the next prediction.
-        
-        Args:
-            history: List of past results (Newest -> Oldest)
-            current_streak: The current loss streak for High/Sureshot bets
-            
-        Returns:
-            best_pred: "BIG" or "SMALL"
-            bet_type: "LOW BET", "HIGH BET", "SURESHOT", or "RECOVERY"
-            best_strength: A confidence score (0.0 to 1.0)
+        Apex V2 Logic: Conflict Filters, ZigZag, and Smart Recovery.
+        Returns: Prediction (or None), Bet Type, Strength
         """
-        
-        # We need at least 15 items to find patterns
-        if len(history) < 15:
-            return "SMALL", "LOW BET", 0.0
+        if len(history) < 15: return None, "WAITING...", 0.0
 
-        # ---------------------------------------------------------
-        # DATA PREPARATION
-        # ---------------------------------------------------------
-        # Convert history format into a clean list of dictionaries.
-        # The input 'history' is ordered Newest -> Oldest.
-        formatted_data = []
-        for h in history:
-            item_dict = {
-                's': h['size'], 
-                'n': int(h['number'])
-            }
-            formatted_data.append(item_dict)
-        
-        # For pattern matching, we need the list to be Oldest -> Newest.
-        # This allows us to scan forward in time.
-        data_rev = list(reversed(formatted_data))
-        
-        # ---------------------------------------------------------
-        # STEP 1: PATTERN SEARCH (DEPTH 5, 4, 3)
-        # ---------------------------------------------------------
+        # 1. MULTI-DEPTH ANALYSIS (The Conflict Filter)
+        # We check Long-term (5) vs Short-term (3)
+        pred5, str5 = self.get_pattern_strength(history, 5)
+        pred3, str3 = self.get_pattern_strength(history, 3)
+        pred4, str4 = self.get_pattern_strength(history, 4)
+
         best_pred = None
         best_strength = 0
-        
-        # We check deep patterns first (length 5), then medium (4), then short (3).
-        search_depths = [5, 4, 3]
-        
-        for depth in search_depths:
-            # Get the most recent sequence of 'size' from the end of our data
-            # Example: If depth is 3, we take the last 3 results (e.g., BIG, SMALL, BIG)
-            last_seq = []
-            for x in data_rev[-depth:]:
-                last_seq.append(x['s'])
-            
-            matches = []
-            
-            # Now scan the entire historical list to find where this sequence occurred before
-            # We stop 'depth + 1' from the end so we don't count the current sequence itself
-            search_limit = len(data_rev) - (depth + 1)
-            
-            for i in range(search_limit):
-                # Extract a chunk of the same length at position i
-                current_chunk = []
-                for x in data_rev[i : i+depth]:
-                    current_chunk.append(x['s'])
-                
-                # If the chunk matches our recent sequence...
-                if current_chunk == last_seq:
-                    # ...record what happened *immediately after* that sequence
-                    next_result = data_rev[i+depth]['s']
-                    matches.append(next_result)
-            
-            # If we found matches in history, calculate the probability
-            if len(matches) > 0:
-                # Count how many BIGs and SMALLs followed this pattern
-                counts = Counter(matches)
-                # Get the most common result (e.g., 'BIG')
-                pred_item = counts.most_common(1)[0][0]
-                # Calculate confidence (Times occurred / Total matches)
-                strength = counts[pred_item] / len(matches)
-                
-                best_pred = pred_item
-                best_strength = strength
-                
-                # If we found a pattern, we break the loop (don't search shallower depths)
-                break 
-        
-        # Fallback: If no pattern was found (rare), just use the last result
-        if best_pred is None:
-            best_pred = data_rev[-1]['s']
+
+        # CONFLICT CHECK: If Depth 5 says BIG and Depth 3 says SMALL -> SKIP
+        if pred5 and pred3 and pred5 != pred3:
+            # Only override conflict if one is a "Super Sureshot" (>90%)
+            if str5 > 0.90: 
+                best_pred, best_strength = pred5, str5
+            elif str3 > 0.90: 
+                best_pred, best_strength = pred3, str3
+            else:
+                # If patterns conflict, we return WAITING (Low Bet Hidden)
+                return None, "WAITING... (CONFLICT)", 0.0
+        else:
+            # No conflict, pick the strongest
+            best_pred = pred5 if str5 >= str4 else pred4
+            best_strength = max(str5, str4, str3)
+
+        if not best_pred:
+            best_pred = history[0]['size'] # Default to last result
             best_strength = 0.5
 
-        # ---------------------------------------------------------
-        # STEP 2: APPLY FILTERS (MOMENTUM & SYMMETRY)
-        # ---------------------------------------------------------
+        # 2. DYNAMIC THRESHOLDS (Panic Adjustment)
+        sureshot_req = 0.85
+        high_req = 0.65
         
-        # Check Momentum: Is the last result the same as our prediction?
-        last_val = data_rev[-1]['s']
-        is_trending = False
-        if last_val == best_pred:
-            is_trending = True
-        
-        # Check Symmetry: Mathematical relationship between last two numbers
-        n1 = data_rev[-1]['n'] # Last number
-        n2 = data_rev[-2]['n'] # Second to last number
-        
-        is_symmetric = False
-        # Condition A: Do they sum to 9? (e.g., 4 and 5)
-        if (n1 + n2) == 9:
-            is_symmetric = True
-        # Condition B: Are they identical? (e.g., 8 and 8)
-        elif n1 == n2:
-            is_symmetric = True
+        if current_streak > 0:
+            sureshot_req += 0.05  # Require 90%
+            high_req += 0.05      # Require 70%
 
-        # ---------------------------------------------------------
-        # STEP 3: DETERMINE BET TYPE (RECOVERY LOGIC)
-        # ---------------------------------------------------------
-        bet_type = "LOW BET"
+        # 3. PATTERN FILTERS
+        last_val = history[0]['size']
+        prev_val = history[1]['size']
         
-        # PRIORITY 1: RECOVERY MODE
-        # If the user has lost 2 or more HIGH/SURESHOT bets in a row,
-        # we completely override the normal logic to flag this as a RECOVERY bet.
+        is_trending = (last_val == best_pred)
+        # ZigZag: Betting that the pattern B-S-B will continue
+        is_zigzag = (last_val != prev_val and best_pred != last_val)
+
+        # Symmetry Check
+        n1 = int(history[0]['number'])
+        n2 = int(history[1]['number'])
+        is_symmetric = (n1 + n2 == 9) or (n1 == n2)
+
+        # 4. FINAL DECISION TREE
+        # Note: We return None for prediction on LOW BETS to hide them
+
+        # A. RECOVERY (Top Priority)
         if current_streak >= 2:
-            bet_type = "RECOVERY"
+            # Safety: If market is totally random (<50%), don't force recovery
+            if best_strength < 0.50: 
+                return None, "SKIP (VOLATILE)", 0.0
+            return best_pred, "RECOVERY", best_strength
+
+        # B. SURESHOT
+        elif best_strength > sureshot_req and is_symmetric:
+            return best_pred, "SURESHOT", best_strength
             
-        # PRIORITY 2: SURESHOT
-        # Requires very high confidence (>85%) AND mathematical symmetry
-        elif best_strength > 0.85 and is_symmetric:
-            bet_type = "SURESHOT"
+        # C. HIGH BET (Supports Trend OR ZigZag)
+        elif best_strength > high_req and (is_trending or is_zigzag):
+            return best_pred, "HIGH BET", best_strength
             
-        # PRIORITY 3: HIGH BET
-        # Requires good confidence (>65%) AND matching momentum trend
-        elif best_strength > 0.65 and is_trending:
-            bet_type = "HIGH BET"
-            
-        # PRIORITY 4: LOW BET
-        # Everything else falls into this category
         else:
-            bet_type = "LOW BET"
-            
-        return best_pred, bet_type, best_strength
+            # HIDE LOW BETS
+            return None, "WAITING...", 0.0
 
 # =====================================================
-# ⚙️ STORAGE (DATABASE MANAGER)
+# 🗄️ OMEGA STORAGE
 # =====================================================
 class OmegaStorage:
     def __init__(self):
-        # Connect to an in-memory SQLite database
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         self.cursor = self.conn.cursor()
-        
-        # Create the table if it doesn't exist
-        create_table_sql = '''
-            CREATE TABLE IF NOT EXISTS results (
-                issue TEXT PRIMARY KEY, 
-                number INTEGER, 
-                size TEXT, 
-                color TEXT, 
-                timestamp TEXT
-            )
-        '''
-        self.cursor.execute(create_table_sql)
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS results (issue TEXT PRIMARY KEY, number INTEGER, size TEXT, color TEXT, timestamp TEXT)''')
         self.conn.commit()
     
     def sync_fast(self):
-        """
-        Fetches 100 records (5 pages) from the API to initialize the database.
-        This matches the logic used in NEW4.PY but ensures web compatibility.
-        """
+        """Fetches latest 500 results (OPTIMAL FOR ACCURACY)."""
         all_data = []
         
-        # Loop through pages 1 to 5
-        for page in range(1, 6): 
+        # LOOP 25 TIMES x 20 ITEMS = 500 RECORDS
+        for page in range(1, 26): 
             try:
-                # Request data from API
-                params = {
-                    "size": "20", 
-                    "pageSize": "20", 
-                    "pageNo": str(page)
-                }
-                r = requests.get(API_URL, params=params, timeout=2)
+                # Timeout set to 2s to keep it snappy
+                r = requests.get(API_URL, params={"size": "20", "pageSize": "20", "pageNo": str(page)}, timeout=2)
                 
                 if r.status_code == 200:
-                    json_data = r.json()
-                    data_list = json_data.get('data', {}).get('list', [])
-                    
-                    if not data_list:
-                        break
-                        
-                    all_data.extend(data_list)
-                else:
+                    data = r.json().get('data', {}).get('list', [])
+                    if not data: break
+                    all_data.extend(data)
+                else: 
                     break
             except: 
                 break
             
-        # Process and insert data into database
         bulk_data = []
         for item in all_data:
             try:
                 issue = str(item['issueNumber'])
                 num = int(item['number'])
+                s = "BIG" if num >= 5 else "SMALL"
                 
-                # Determine Size
-                if num >= 5:
-                    s = "BIG"
-                else:
-                    s = "SMALL"
+                if num in [0, 5]: c = "VIOLET"
+                elif num % 2 == 1: c = "GREEN"
+                else: c = "RED"
                 
-                # Determine Color (Standard Wingo Rules)
-                if num in [0, 5]:
-                    c = "VIOLET"
-                elif num % 2 == 1:
-                    c = "GREEN"
-                else:
-                    c = "RED"
-                
-                current_time = str(datetime.now())
-                
-                record = (issue, num, s, c, current_time)
-                bulk_data.append(record)
-            except: 
-                continue
+                bulk_data.append((issue, num, s, c, str(datetime.now())))
+            except: continue
             
-        if len(bulk_data) > 0:
-            insert_sql = "INSERT OR IGNORE INTO results VALUES (?, ?, ?, ?, ?)"
-            self.cursor.executemany(insert_sql, bulk_data)
+        if bulk_data:
+            self.cursor.executemany("INSERT OR IGNORE INTO results VALUES (?, ?, ?, ?, ?)", bulk_data)
             self.conn.commit()
 
     def get_history(self, limit=2000):
-        """
-        Retrieves the latest history from the database.
-        """
         try:
-            select_sql = f"SELECT issue, number, size, color FROM results ORDER BY issue DESC LIMIT {limit}"
-            self.cursor.execute(select_sql)
-            rows = self.cursor.fetchall()
-            
-            result_list = []
-            for r in rows:
-                item = {
-                    "issue": r[0], 
-                    "number": r[1], 
-                    "size": r[2], 
-                    "color": r[3]
-                }
-                result_list.append(item)
-                
-            return result_list
-        except: 
-            return []
+            self.cursor.execute(f"SELECT issue, number, size, color FROM results ORDER BY issue DESC LIMIT {limit}")
+            return [{"issue": r[0], "number": r[1], "size": r[2], "color": r[3]} for r in self.cursor.fetchall()]
+        except: return []
