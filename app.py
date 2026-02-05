@@ -1,271 +1,270 @@
 import os
-import requests
-import sqlite3
-import threading
-import time
 from datetime import datetime
-from collections import Counter
-from flask import Flask, render_template_string, jsonify, redirect
+from flask import Flask, render_template_string, request, session, redirect, url_for
+from logic_core import ApexQuantum, OmegaStorage
 
-# ==========================================
-# ⚙️ CONFIGURATION
-# ==========================================
-API_URL = "https://api-iok6.onrender.com/api/get_history"
-PLATFORM_URL = "https://example.com" 
-
+# =====================================================
+# 🏛️ CONFIGURATION
+# =====================================================
 app = Flask(__name__)
+# Generate a random secret key for session security
+app.secret_key = os.urandom(24)
 
-# ==========================================
-# 🧠 LOGIC ENGINE (FROM YOUR WORKING FILE)
-# ==========================================
-class TitanLogic:
-    def __init__(self):
-        self.streak = 0
-        self.wins = 0
-        self.losses = 0
+# 🔐 SECURITY SETTINGS
+ACCESS_KEY = "perfect007"
+# Expiration set to Feb 6, 2026
+EXPIRY_DATE = datetime(2026, 2, 6, 23, 59) 
 
-    def analyze(self, history):
-        # history: list of dicts [{'n': 1, 's': 'SMALL', 'id': '123'}] (Oldest -> Newest)
-        if len(history) < 15: return None, "SYNCING..."
+# Initialize Logic Class and Database Class
+db = OmegaStorage()
+brain = ApexQuantum()
 
-        # 1. VIOLET CHECK (0/5)
-        last_n = history[-1]['n']
-        is_violet = (last_n == 0 or last_n == 5)
+# =====================================================
+# 🌐 UI TEMPLATES
+# =====================================================
 
-        # 2. PATTERN SCAN
-        pred5, str5 = self.get_pattern(history, 5)
-        pred3, str3 = self.get_pattern(history, 3)
-
-        if pred5 and pred3 and pred5 != pred3:
-            if str5 > 0.90: best_pred, strength = pred5, str5
-            elif str3 > 0.90: best_pred, strength = pred3, str3
-            else: return None, "WAITING... (CONFLICT)"
-        else:
-            best_pred = pred5 if str5 >= str3 else pred3
-            strength = max(str5, str3)
-
-        if not best_pred:
-             best_pred = history[-1]['s']
-             strength = 0.5
-
-        # 3. DECISION
-        n1, n2 = history[-1]['n'], history[-2]['n']
-        is_symmetric = (n1 + n2 == 9 or n1 == n2)
-
-        if is_violet:
-            if strength > 0.90 and is_symmetric: return best_pred, "SURESHOT (VIOLET SAFE)"
-            else: return None, "SKIP (0/5 DETECTED)"
-
-        if self.streak >= 2: return best_pred, "RECOVERY"
-        if strength > 0.85 and is_symmetric: return best_pred, "SURESHOT"
-        if strength > 0.65: return best_pred, "HIGH BET"
-        
-        return None, "WAITING..."
-
-    def get_pattern(self, history, depth):
-        if len(history) < depth + 1: return None, 0
-        last_seq = [x['s'] for x in history[-depth:]]
-        matches = [history[i+depth]['s'] for i in range(len(history)-(depth+1)) 
-                   if [x['s'] for x in history[i:i+depth]] == last_seq]
-        if matches:
-            c = Counter(matches)
-            top = c.most_common(1)[0]
-            return top[0], top[1]/len(matches)
-        return None, 0
-
-engine = TitanLogic()
-
-# ==========================================
-# 💾 MEMORY DATABASE (The Fix)
-# ==========================================
-# We use a global list instead of a file. fast & reliable.
-DB_MEMORY = [] 
-
-def sync_data():
-    """Forces 100 items download on startup"""
-    global DB_MEMORY
-    print("🔄 SYNCING DATA...")
-    temp_data = []
-    # Loop exactly like your working code
-    for p in range(1, 6):
-        try:
-            r = requests.get(API_URL, params={"size": "20", "pageNo": str(p)}, timeout=5)
-            if r.status_code == 200:
-                items = r.json().get('data', {}).get('list', [])
-                for item in items:
-                    temp_data.append({
-                        'n': int(item['number']),
-                        's': "BIG" if int(item['number']) >= 5 else "SMALL",
-                        'id': str(item['issueNumber'])
-                    })
-        except: pass
-    
-    # Sort Oldest -> Newest
-    temp_data.sort(key=lambda x: int(x['id']))
-    
-    # Update Global DB (remove duplicates)
-    seen = set()
-    new_db = []
-    for d in temp_data:
-        if d['id'] not in seen:
-            new_db.append(d)
-            seen.add(d['id'])
-    
-    DB_MEMORY = new_db
-    print(f"✅ SYNC DONE. RECORDS: {len(DB_MEMORY)}")
-
-# ==========================================
-# 🔄 WORKER LOOP
-# ==========================================
-global_state = {
-    "period": "Loading...", "prediction": "--", "type": "WAITING...",
-    "streak": 0, "w": 0, "l": 0, "count": 0, "logs": []
-}
-
-def worker():
-    sync_data() # Initial Load
-    
-    last_id = None
-    active_bet = None
-
-    while True:
-        try:
-            # Poll latest
-            r = requests.get(API_URL, params={"size": "1", "pageNo": "1"}, timeout=5)
-            if r.status_code == 200:
-                raw = r.json()['data']['list'][0]
-                curr_id = str(raw['issueNumber'])
-                
-                # Add to memory
-                new_item = {
-                    'n': int(raw['number']),
-                    's': "BIG" if int(raw['number']) >= 5 else "SMALL",
-                    'id': curr_id
-                }
-                
-                if not DB_MEMORY or DB_MEMORY[-1]['id'] != curr_id:
-                    DB_MEMORY.append(new_item)
-                    if len(DB_MEMORY) > 1000: DB_MEMORY.pop(0)
-
-                if curr_id != last_id:
-                    # Check Win/Loss
-                    if active_bet and active_bet['id'] == curr_id:
-                        real = new_item['s']
-                        if "SKIP" not in active_bet['type'] and "WAITING" not in active_bet['type']:
-                            if active_bet['pred'] == real:
-                                engine.wins += 1
-                                engine.streak = 0
-                                res = "WIN"
-                            else:
-                                engine.losses += 1
-                                engine.streak += 1
-                                res = "LOSS"
-                            global_state['logs'].insert(0, {"id":curr_id[-4:], "r":real, "s":res})
-                    
-                    # Predict Next
-                    next_id = str(int(curr_id) + 1)
-                    pred, p_type = engine.analyze(DB_MEMORY)
-                    
-                    active_bet = {'id': next_id, 'pred': pred, 'type': p_type}
-                    last_id = curr_id
-                    
-                    global_state.update({
-                        "period": next_id, "prediction": pred if pred else "--", "type": p_type,
-                        "streak": engine.streak, "w": engine.wins, "l": engine.losses,
-                        "count": len(DB_MEMORY)
-                    })
-            time.sleep(2)
-        except: time.sleep(5)
-
-threading.Thread(target=worker, daemon=True).start()
-
-# ==========================================
-# 🌐 UI
-# ==========================================
-HTML = """
+LOGIN_HTML = """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TITAN PRO V5</title>
+    <title>APEX LOGIN</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { background: #000; color: #fff; font-family: monospace; padding: 20px; display: flex; flex-direction: column; align-items: center; }
-        .box { border: 1px solid #333; padding: 20px; width: 100%; max-width: 600px; margin-bottom: 20px; border-radius: 8px; background: #090909; }
-        .h-row { display: flex; justify-content: space-between; border-bottom: 1px solid #222; padding-bottom: 10px; margin-bottom: 20px; }
-        .big-txt { font-size: 60px; font-weight: bold; margin: 20px 0; }
-        .tag { padding: 5px 10px; border-radius: 4px; font-weight: bold; }
-        .SURESHOT { background: #ff0055; color: white; }
-        .HIGH { background: #ffd700; color: black; }
-        .RECOVERY { background: #00ff88; color: black; }
-        .SKIP { border: 1px solid #555; color: #888; }
-        .WAITING... { color: #555; }
-        .BIG { color: #ff4757; } .SMALL { color: #2ed573; }
-        .log-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #111; }
-        .btn { display: block; width: 100%; background: #00f2ff; color: #000; padding: 15px; text-align: center; text-decoration: none; font-weight: bold; margin-top: 10px; }
+        body { background: #000; color: #00ff00; font-family: 'Consolas', 'Monaco', monospace; display: flex; height: 100vh; align-items: center; justify-content: center; margin: 0; }
+        .box { border: 2px solid #00ff00; padding: 20px; width: 300px; text-align: center; }
+        input { background: #000; color: #fff; border: 1px solid #333; padding: 10px; width: 80%; font-family: monospace; text-align: center; margin: 10px 0; }
+        button { background: #00ff00; color: #000; border: none; padding: 10px 20px; font-weight: bold; cursor: pointer; width: 100%; font-family: monospace; }
+        .err { color: red; margin-top: 10px; }
     </style>
 </head>
 <body>
     <div class="box">
-        <div class="h-row">
-            <span>TITAN PRO V5</span>
-            <span style="color:#00f2ff">DB: <span id="db">0</span></span>
-        </div>
-        <div style="text-align: center;">
-            <div style="color:#888">PERIOD: <span id="p">Scanning...</span></div>
-            <div style="margin-top:10px;"><span id="t" class="tag WAITING...">WAITING...</span></div>
-            <div id="pred" class="big-txt">--</div>
-            <div id="alert" style="display:none; color:#ff0055; font-weight:bold;">⚠️ RECOVERY MODE</div>
-        </div>
-        <a href="/go" class="btn">OPEN PLATFORM</a>
+        <h3>[ APEX QUANTUM ]</h3>
+        <form method="POST">
+            <input type="password" name="key" placeholder="ENTER KEY" required>
+            <button type="submit">LOGIN >> </button>
+        </form>
+        {% if error %}<div class="err">{{ error }}</div>{% endif %}
     </div>
-
-    <div class="box">
-        <div class="h-row">
-            <span>HISTORY</span>
-            <span>W:<span id="w">0</span> L:<span id="l">0</span></span>
-        </div>
-        <div id="logs"></div>
-    </div>
-
-    <script>
-        setInterval(() => {
-            fetch('/api/state').then(r => r.json()).then(d => {
-                document.getElementById('db').innerText = d.count;
-                document.getElementById('p').innerText = d.period;
-                document.getElementById('t').innerText = d.type;
-                document.getElementById('t').className = 'tag ' + d.type.split(' ')[0];
-                document.getElementById('pred').innerText = d.prediction;
-                document.getElementById('pred').className = 'big-txt ' + d.prediction;
-                document.getElementById('w').innerText = d.w;
-                document.getElementById('l').innerText = d.l;
-                
-                if (d.streak > 0) document.getElementById('alert').style.display = 'block';
-                else document.getElementById('alert').style.display = 'none';
-
-                document.getElementById('logs').innerHTML = d.logs.map(l => `
-                    <div class="log-row">
-                        <span>#${l.id}</span>
-                        <span class="${l.r}">${l.r}</span>
-                        <span style="color:${l.s=='WIN'?'#00ff88':'#ff0055'}">${l.s}</span>
-                    </div>
-                `).join('');
-            });
-        }, 1000);
-    </script>
 </body>
 </html>
 """
 
+TERMINAL_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>APEX QUANTUM UI</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="30">
+    <style>
+        body { background-color: #000000; color: #e0e0e0; font-family: 'Consolas', 'Monaco', monospace; margin: 0; padding: 15px; font-size: 14px; }
+        a { text-decoration: none; }
+        
+        .header { border-bottom: 1px dashed #333; padding-bottom: 10px; margin-bottom: 20px; color: #666; }
+        .btn-refresh { display: block; background: #111; color: #00ff00; text-align: center; padding: 10px; margin-bottom: 20px; border: 1px solid #333; font-weight: bold; text-transform: uppercase; }
+        .block { margin-bottom: 25px; }
+        
+        .tag-high { background-color: #d4ac0d; color: #000; padding: 2px 8px; font-weight: bold; display: inline-block; }
+        .tag-low { background-color: #0044cc; color: #fff; padding: 2px 8px; font-weight: bold; display: inline-block; }
+        .tag-sureshot { background-color: #ff0000; color: #fff; padding: 2px 8px; font-weight: bold; display: inline-block; border: 1px solid yellow; }
+        .tag-recovery { background-color: #00aa00; color: #fff; padding: 2px 8px; font-weight: bold; display: inline-block; border: 1px solid white; box-shadow: 0 0 10px green; }
+        
+        .period-text { color: #888; margin-left: 5px; }
+        .target-line { margin-top: 4px; font-size: 16px; }
+        
+        .res-line { margin-top: 5px; font-size: 14px; }
+        .win-icon { color: #00ff00; font-weight: bold; }
+        .loss-icon { color: #ff0055; font-weight: bold; }
+        .wait-icon { color: #666; }
+        .loss-streak { color: #888; font-size: 12px; margin-left: 5px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        > ENGINE: APEX_QUANTUM<br>
+        > DB_RECORDS: {{ db_count }}<br>
+        > PLAY- DON'T BET ON LOW BETE ONLY HIGH AND SURESHOTS PLAY 4 LEVEL MAX
+    </div>
+
+    <a href="/" class="btn-refresh">[ SYNC DATA ]</a>
+
+    <div class="block">
+        <div>
+            {% if tag_type == 'RECOVERY' %}
+                <span class="tag-recovery">🚨 RECOVERY</span>
+            {% elif tag_type == 'SURESHOT' %}
+                <span class="tag-sureshot">💎 SURESHOT</span>
+            {% elif tag_type == 'HIGH BET' %}
+                <span class="tag-high">🔥 HIGH BET</span>
+            {% else %}
+                <span class="tag-low">🔹 LOW BET</span>
+            {% endif %}
+            <span class="period-text">| Period: {{ next_issue }}</span>
+        </div>
+        <div class="target-line">
+            Target: <span style="color: {{ 'yellow' if pred == 'BIG' else '#00aaff' }}; font-weight: bold;">{{ pred }}</span>
+        </div>
+    </div>
+
+    <div style="border-bottom: 1px dashed #333; margin: 20px 0;"></div>
+
+    {% for row in history_rows %}
+    <div class="block">
+        <div>
+            {% if row.tag == 'RECOVERY' %}
+                <span class="tag-recovery">🚨 RECOVERY</span>
+            {% elif row.tag == 'SURESHOT' %}
+                <span class="tag-sureshot">💎 SURESHOT</span>
+            {% elif row.tag == 'HIGH BET' %}
+                <span class="tag-high">🔥 HIGH BET</span>
+            {% else %}
+                <span class="tag-low">🔹 LOW BET</span>
+            {% endif %}
+            <span class="period-text">| Period: {{ row.issue }} | Target: {{ row.pred }}</span>
+        </div>
+        
+        <div class="res-line">
+            {% if row.res == 'WIN' %}
+                <span class="win-icon">✅ WIN</span>
+            {% elif row.res == 'LOSS' %}
+                <span class="loss-icon">❌ LOSS</span>
+            {% else %}
+                <span class="wait-icon">⏳ WAIT</span>
+            {% endif %}
+            
+            <span style="color:#ccc"> | Result: {{ row.actual }}</span>
+            
+            {% if row.streak > 0 %}
+                <span class="loss-streak">(Loss Streak: {{ row.streak }})</span>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+
+</body>
+</html>
+"""
+
+# =====================================================
+# 🛤️ ROUTES
+# =====================================================
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Handles user login with key validation."""
+    error = None
+    if request.method == 'POST':
+        user_key = request.form.get('key')
+        
+        if user_key == ACCESS_KEY:
+            # Check if key is expired
+            if datetime.now() > EXPIRY_DATE:
+                error = "KEY EXPIRED"
+            else:
+                session['logged_in'] = True
+                return redirect(url_for('dashboard'))
+        else:
+            error = "INVALID KEY"
+            
+    return render_template_string(LOGIN_HTML, error=error)
+
 @app.route('/')
-def index(): return render_template_string(HTML)
+def dashboard():
+    """Main dashboard logic with Streak Replay Engine."""
+    if not session.get('logged_in'): 
+        return redirect(url_for('login'))
+    
+    # 1. FETCH DATA
+    db.sync_fast() 
+    
+    history = db.get_history(2000)
+    if not history: 
+        return "LOADING DATA... PLEASE REFRESH IN 5 SECONDS"
 
-@app.route('/api/state')
-def state(): return jsonify(global_state)
+    # 3. REPLAY ENGINE: CALCULATE HISTORICAL STREAKS
+    # We must scan history from Oldest -> Newest to correctly calculate
+    # what the 'streak' was at any given moment in the past.
+    
+    # We analyze the last 50 rounds to ensure accuracy
+    analysis_slice = history[:50] 
+    
+    # Reverse so we iterate from Oldest -> Newest
+    analysis_slice.reverse() 
+    
+    processed_rows = []
+    current_high_loss_streak = 0
+    
+    # Loop through past rounds to build up the streak state
+    # We stop at len-1 because the last item is our 'Next Prediction' context
+    for i in range(len(analysis_slice) - 1): 
+        current_item = analysis_slice[i+1] # The result we are checking
+        past_context = analysis_slice[:i+1] # All data available BEFORE that result
+        
+        # The Brain expects history in Newest -> Oldest format
+        brain_context = list(reversed(past_context))
+        
+        # Skip if not enough data
+        if len(brain_context) < 15: 
+            continue 
+        
+        # PREDICT using the streak known AT THAT TIME
+        p_pred, p_tag, p_conf = brain.analyze_bet_type(brain_context, current_high_loss_streak)
+        
+        actual = current_item['size']
+        res = "LOSS"
+        if p_pred == actual: 
+            res = "WIN"
+        
+        # SAVE STATE FOR DISPLAY
+        # We want to show what the streak was *entering* this round
+        streak_for_display = current_high_loss_streak
 
-@app.route('/go')
-def go(): return redirect(PLATFORM_URL)
+        # UPDATE STREAK FOR NEXT ROUND (The Replay Logic)
+        if res == "WIN":
+            # Any Win resets the High Loss Streak
+            current_high_loss_streak = 0
+        elif res == "LOSS":
+            # Only High Priority Bets increase the streak
+            if p_tag in ["HIGH BET", "SURESHOT", "RECOVERY"]:
+                current_high_loss_streak += 1
+            # Low Bets are ignored (streak stays the same)
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5003))
+        processed_rows.append({
+            "issue": current_item['issue'],
+            "pred": p_pred,
+            "conf": int(p_conf*100),
+            "tag": p_tag,
+            "res": res,
+            "actual": actual,
+            "streak": streak_for_display 
+        })
+
+    # 4. PREDICT THE FUTURE (NEXT ROUND)
+    # Now that we have the accurate 'current_high_loss_streak', we predict the next live round
+    pred, tag_type, conf = brain.analyze_bet_type(history, current_high_loss_streak)
+    
+    # Calculate Next Issue Number
+    try: 
+        next_issue = int(history[0]['issue']) + 1
+    except: 
+        next_issue = "Unknown"
+
+    # 5. PREPARE FINAL DISPLAY
+    # Reverse back to Newest -> Oldest for the HTML list
+    processed_rows.reverse()
+    
+    # Slice the top 10 for the UI
+    display_rows = processed_rows[:10] 
+
+    return render_template_string(TERMINAL_HTML, 
+                                  next_issue=next_issue, 
+                                  pred=pred, 
+                                  conf=int(conf*100), 
+                                  tag_type=tag_type,
+                                  db_count=len(history),
+                                  history_rows=display_rows)
+
+if __name__ == "__main__":
+    port = int(os.environ.get('PORT', 10001))
+
     app.run(host='0.0.0.0', port=port)
